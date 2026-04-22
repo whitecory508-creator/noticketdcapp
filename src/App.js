@@ -13,6 +13,9 @@ import {
   useMap,
 } from "react-leaflet";
 
+const MAPBOX_ACCESS_TOKEN =
+  "pk.eyJ1Ijoibm90aWNrZXRkYyIsImEiOiJjbW85M3R2azQwNWQyMnFxNWpsZWtnenVzIn0.nbseqgxasMJptlzC2A8qbw";
+
 const DC_CAMERA_API =
   "https://maps2.dcgis.dc.gov/dcgis/rest/services/DCGIS_DATA/Public_Safety_WebMercator/MapServer/47/query?f=json&where=1%3D1&outFields=ENFORCEMENT_SPACE_CODE,LOCATION_DESCRIPTION,SITE_CODE,ACTIVE_STATUS,CAMERA_STATUS,DEVICE_MOBILITY,ENFORCEMENT_TYPE,SPEED_LIMIT,CAMERA_LATITUDE,CAMERA_LONGITUDE,WARD,ANC,SMD,OBJECTID";
 
@@ -63,26 +66,6 @@ function formatDuration(seconds) {
   return rem === 0 ? `${hrs} hr` : `${hrs} hr ${rem} min`;
 }
 
-function getAlertText(camera) {
-  if (camera.type === "speed") {
-    return "Speed camera ahead, please follow posted speed limit.";
-  }
-
-  if (camera.type === "red_light") {
-    return "Red light camera ahead.";
-  }
-
-  if (camera.type === "stop_sign") {
-    return "Stop sign camera ahead.";
-  }
-
-  if (camera.type === "bus_lane" || camera.type === "truck") {
-    return "Traffic enforcement camera ahead.";
-  }
-
-  return "Traffic camera ahead.";
-}
-
 function getHeadingDegrees(coords) {
   const heading =
     coords && typeof coords.heading === "number" ? coords.heading : null;
@@ -95,6 +78,33 @@ function getCardinalDirection(heading) {
   return directions[Math.round(heading / 45) % 8];
 }
 
+function bearingBetweenPoints(lat1, lon1, lat2, lon2) {
+  const phi1 = toRadians(lat1);
+  const phi2 = toRadians(lat2);
+  const lambda1 = toRadians(lon1);
+  const lambda2 = toRadians(lon2);
+
+  const y = Math.sin(lambda2 - lambda1) * Math.cos(phi2);
+  const x =
+    Math.cos(phi1) * Math.sin(phi2) -
+    Math.sin(phi1) * Math.cos(phi2) * Math.cos(lambda2 - lambda1);
+
+  const theta = Math.atan2(y, x);
+  return ((theta * 180) / Math.PI + 360) % 360;
+}
+
+function smallestAngleDifference(a, b) {
+  const diff = Math.abs(a - b) % 360;
+  return diff > 180 ? 360 - diff : diff;
+}
+
+function isLikelyAhead(userHeading, bearingToCamera) {
+  if (!Number.isFinite(userHeading) || !Number.isFinite(bearingToCamera)) {
+    return true;
+  }
+  return smallestAngleDifference(userHeading, bearingToCamera) <= 70;
+}
+
 function toBool(value, fallback) {
   if (value === null || value === undefined || value === "") return fallback;
   return value === "true";
@@ -102,7 +112,7 @@ function toBool(value, fallback) {
 
 function toNumber(value, fallback) {
   const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : fallback;
+  return Number.isFinite(parsed) && parsed >= 50 ? parsed : fallback;
 }
 
 async function savePref(key, value) {
@@ -145,8 +155,35 @@ async function requestNotificationPermission() {
   return permission.display === "granted";
 }
 
+async function getFreshPosition() {
+  if (isNativeApp()) {
+    return Geolocation.getCurrentPosition({
+      enableHighAccuracy: true,
+      timeout: 20000,
+      maximumAge: 5000,
+    });
+  }
+
+  return new Promise((resolve, reject) => {
+    if (!navigator.geolocation) {
+      reject(new Error("Geolocation is not supported on this device/browser."));
+      return;
+    }
+
+    navigator.geolocation.getCurrentPosition(
+      (pos) => resolve(pos),
+      (err) => reject(err),
+      {
+        enableHighAccuracy: true,
+        timeout: 20000,
+        maximumAge: 5000,
+      }
+    );
+  });
+}
+
 function speakText(text) {
-  if (typeof window === "undefined" || !window.speechSynthesis) return;
+  if (typeof window === "undefined" || !window.speechSynthesis || !text) return;
   window.speechSynthesis.cancel();
   const utterance = new SpeechSynthesisUtterance(text);
   utterance.rate = 1;
@@ -172,70 +209,26 @@ async function fireLocalNotification(title, body, id) {
   }
 }
 
-async function searchPlaces(query) {
-  if (!query || query.trim().length < 2) return [];
+function getCameraAlertText(camera, distanceFeet) {
+  const rounded = Math.max(25, Math.round(distanceFeet / 25) * 25);
 
-  const url =
-    "https://nominatim.openstreetmap.org/search?format=jsonv2&addressdetails=1&limit=8&countrycodes=us&viewbox=-77.65,39.75,-76.85,37.85&bounded=1&q=" +
-    encodeURIComponent(query.trim());
-
-  const response = await fetch(url, {
-    headers: {
-      Accept: "application/json",
-    },
-  });
-
-  if (!response.ok) {
-    throw new Error("Place search failed.");
+  if (camera.type === "speed") {
+    return `Speed camera ahead in ${rounded} feet. Please obey posted speed limit.`;
   }
 
-  const data = await response.json();
-
-  return data.map((item) => {
-    const parts = String(item.display_name || "")
-      .split(",")
-      .map((part) => part.trim())
-      .filter(Boolean);
-
-    return {
-      id: item.place_id,
-      name: parts[0] || item.display_name,
-      subtitle: parts.slice(1, 5).join(", "),
-      full: item.display_name,
-      lat: Number(item.lat),
-      lng: Number(item.lon),
-    };
-  });
-}
-
-async function getRoute(originLat, originLng, destLat, destLng) {
-  const coordinates = `${originLng},${originLat};${destLng},${destLat}`;
-  const url =
-    `https://router.project-osrm.org/route/v1/driving/${coordinates}` +
-    `?overview=full&geometries=geojson&steps=true`;
-
-  const response = await fetch(url);
-
-  if (!response.ok) {
-    throw new Error("Route request failed.");
+  if (camera.type === "red_light") {
+    return `Red light camera ahead in ${rounded} feet.`;
   }
 
-  const data = await response.json();
-
-  if (!data.routes || !data.routes.length) {
-    throw new Error("No route found.");
+  if (camera.type === "stop_sign") {
+    return "Stop sign camera ahead. Please come to a complete stop before the white line and remain for 2 to 5 seconds before you proceed.";
   }
 
-  const route = data.routes[0];
-  const legs = route.legs || [];
-  const steps = legs.flatMap((leg) => leg.steps || []);
+  if (camera.type === "bus_lane" || camera.type === "truck") {
+    return `Traffic enforcement camera ahead in ${rounded} feet.`;
+  }
 
-  return {
-    distanceMeters: route.distance,
-    durationSeconds: route.duration,
-    geometry: route.geometry?.coordinates || [],
-    steps,
-  };
+  return `Traffic camera ahead in ${rounded} feet.`;
 }
 
 function pointToSegmentDistanceMeters(point, start, end) {
@@ -251,7 +244,6 @@ function pointToSegmentDistanceMeters(point, start, end) {
   }
 
   const t = ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy);
-
   const clamped = Math.max(0, Math.min(1, t));
   const closestX = x1 + clamped * dx;
   const closestY = y1 + clamped * dy;
@@ -268,36 +260,79 @@ function isCameraNearRoute(camera, routeCoords, thresholdMeters = 120) {
     const start = [routeCoords[i][1], routeCoords[i][0]];
     const end = [routeCoords[i + 1][1], routeCoords[i + 1][0]];
     const distance = pointToSegmentDistanceMeters(point, start, end);
-
-    if (distance <= thresholdMeters) {
-      return true;
-    }
+    if (distance <= thresholdMeters) return true;
   }
 
   return false;
+}
+
+function distanceToRouteMeters(lat, lng, routeCoords) {
+  if (!routeCoords || routeCoords.length < 2) return Infinity;
+
+  const point = [lng, lat];
+  let minDistance = Infinity;
+
+  for (let i = 0; i < routeCoords.length - 1; i++) {
+    const start = [routeCoords[i][1], routeCoords[i][0]];
+    const end = [routeCoords[i + 1][1], routeCoords[i + 1][0]];
+    const distance = pointToSegmentDistanceMeters(point, start, end);
+    if (distance < minDistance) minDistance = distance;
+  }
+
+  return minDistance;
+}
+
+function getStepProgressDistance(step, lat, lng) {
+  const intersections = Array.isArray(step?.intersections)
+    ? step.intersections
+    : [];
+  if (intersections.length === 0) {
+    const loc = step?.maneuver?.location;
+    if (!Array.isArray(loc) || loc.length < 2) return Infinity;
+    return distanceInMeters(lat, lng, loc[1], loc[0]);
+  }
+
+  let minDistance = Infinity;
+  for (const item of intersections) {
+    const loc = item?.location;
+    if (!Array.isArray(loc) || loc.length < 2) continue;
+    const d = distanceInMeters(lat, lng, loc[1], loc[0]);
+    if (d < minDistance) minDistance = d;
+  }
+  return minDistance;
+}
+
+function stripHtml(text) {
+  if (!text) return "";
+  return String(text)
+    .replace(/<[^>]+>/g, "")
+    .trim();
 }
 
 function buildStepInstruction(step) {
   const type = step?.maneuver?.type || "continue";
   const modifier = step?.maneuver?.modifier || "";
   const name = step?.name || "";
+  const cleanedModifier = modifier === "straight" ? "straight" : modifier;
 
   if (type === "depart") return `Start on ${name || "the road"}`;
   if (type === "arrive") return "You have arrived at your destination";
   if (type === "roundabout") {
-    return `Enter roundabout${name ? ` toward ${name}` : ""}`;
+    return `Enter the roundabout${name ? ` toward ${name}` : ""}`;
   }
   if (type === "turn") {
-    return `Turn ${modifier || "ahead"}${name ? ` onto ${name}` : ""}`;
+    return `Turn ${cleanedModifier || "ahead"}${name ? ` onto ${name}` : ""}`;
   }
   if (type === "merge") {
     return `Merge${name ? ` onto ${name}` : ""}`;
   }
   if (type === "fork") {
-    return `Keep ${modifier || "forward"}${name ? ` toward ${name}` : ""}`;
+    return `Keep ${cleanedModifier || "forward"}${
+      name ? ` toward ${name}` : ""
+    }`;
   }
   if (type === "end of road") {
-    return `At end of road, turn ${modifier || "ahead"}${
+    return `At the end of the road, turn ${cleanedModifier || "ahead"}${
       name ? ` onto ${name}` : ""
     }`;
   }
@@ -305,13 +340,44 @@ function buildStepInstruction(step) {
     return `Continue onto ${name || "the road"}`;
   }
   if (type === "on ramp") {
-    return `Take ramp${name ? ` to ${name}` : ""}`;
+    return `Take the ramp${name ? ` to ${name}` : ""}`;
   }
   if (type === "off ramp") {
-    return `Take exit${name ? ` toward ${name}` : ""}`;
+    return `Take the exit${name ? ` toward ${name}` : ""}`;
   }
 
   return name ? `Continue on ${name}` : "Continue straight";
+}
+
+function getMapboxVoiceInstruction(step, mode = "main") {
+  const voiceInstructions = Array.isArray(step?.voiceInstructions)
+    ? step.voiceInstructions
+    : [];
+
+  if (!voiceInstructions.length) return "";
+
+  if (mode === "early") {
+    const sorted = [...voiceInstructions].sort(
+      (a, b) => (b.distanceAlongGeometry || 0) - (a.distanceAlongGeometry || 0)
+    );
+    return stripHtml(sorted[0]?.announcement || "");
+  }
+
+  const sorted = [...voiceInstructions].sort(
+    (a, b) => (a.distanceAlongGeometry || 0) - (b.distanceAlongGeometry || 0)
+  );
+  return stripHtml(sorted[0]?.announcement || "");
+}
+
+function getSpokenInstruction(step, mode = "main") {
+  const fromMapbox = getMapboxVoiceInstruction(step, mode);
+  if (fromMapbox) return fromMapbox;
+
+  const fallback = buildStepInstruction(step);
+  if (mode === "early" && fallback) {
+    return `Ahead, ${fallback.toLowerCase()}`;
+  }
+  return fallback;
 }
 
 function getCameraColor(camera) {
@@ -319,6 +385,122 @@ function getCameraColor(camera) {
   if (camera.type === "red_light") return "#f59e0b";
   if (camera.type === "stop_sign") return "#8b5cf6";
   return "#3b82f6";
+}
+
+async function searchPlaces(query) {
+  if (!query || query.trim().length < 2) return [];
+
+  const url =
+    "https://api.mapbox.com/search/geocode/v6/forward?q=" +
+    encodeURIComponent(query.trim()) +
+    "&bbox=-77.65,37.85,-76.85,39.75" +
+    "&country=US" +
+    "&limit=8" +
+    `&access_token=${encodeURIComponent(MAPBOX_ACCESS_TOKEN)}`;
+
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    throw new Error("Place search failed.");
+  }
+
+  const data = await response.json();
+  const features = Array.isArray(data.features) ? data.features : [];
+
+  return features
+    .map((feature) => {
+      const coords = feature?.geometry?.coordinates || [];
+      return {
+        id:
+          feature.properties?.mapbox_id ||
+          feature.id ||
+          Math.random().toString(36),
+        name:
+          feature.properties?.name ||
+          feature.properties?.full_address ||
+          "Destination",
+        subtitle:
+          feature.properties?.full_address ||
+          feature.properties?.place_formatted ||
+          "",
+        full:
+          feature.properties?.full_address ||
+          feature.properties?.name ||
+          "Destination",
+        lng: Number(coords[0]),
+        lat: Number(coords[1]),
+      };
+    })
+    .filter((item) => Number.isFinite(item.lat) && Number.isFinite(item.lng));
+}
+
+async function getRoute(originLat, originLng, destLat, destLng) {
+  if (
+    !Number.isFinite(originLat) ||
+    !Number.isFinite(originLng) ||
+    !Number.isFinite(destLat) ||
+    !Number.isFinite(destLng)
+  ) {
+    throw new Error(
+      "Route could not be built because location coordinates are missing."
+    );
+  }
+
+  const coordinates = `${originLng},${originLat};${destLng},${destLat}`;
+  const url =
+    `https://api.mapbox.com/directions/v5/mapbox/driving-traffic/${coordinates}` +
+    `?alternatives=true` +
+    `&geometries=geojson` +
+    `&steps=true` +
+    `&voice_instructions=true` +
+    `&banner_instructions=true` +
+    `&overview=full` +
+    `&annotations=distance,duration,speed` +
+    `&access_token=${encodeURIComponent(MAPBOX_ACCESS_TOKEN)}`;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+
+    if (!response.ok) {
+      throw new Error(`Route request failed (${response.status}).`);
+    }
+
+    const data = await response.json();
+
+    if (!data.routes || !data.routes.length) {
+      throw new Error("No driving route was found.");
+    }
+
+    const route = data.routes[0];
+    const alternatives = data.routes.slice(1, 3).map((r, index) => ({
+      id: `alt-${index + 1}`,
+      distanceMeters: r.distance,
+      durationSeconds: r.duration,
+      geometry: r.geometry?.coordinates || [],
+      steps: (r.legs || []).flatMap((leg) => leg.steps || []),
+    }));
+
+    const legs = route.legs || [];
+    const steps = legs.flatMap((leg) => leg.steps || []);
+
+    return {
+      distanceMeters: route.distance,
+      durationSeconds: route.duration,
+      geometry: route.geometry?.coordinates || [],
+      steps,
+      alternatives,
+    };
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error("Route request timed out. Please try again.");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function RecenterMap({ center, zoom }) {
@@ -365,12 +547,19 @@ export default function App() {
   const [searching, setSearching] = useState(false);
   const [isNavigating, setIsNavigating] = useState(false);
   const [navStepIndex, setNavStepIndex] = useState(0);
+  const [alternativeRoutes, setAlternativeRoutes] = useState([]);
+  const [rerouting, setRerouting] = useState(false);
 
   const watchIdRef = useRef(null);
   const spokenCameraIdsRef = useRef({});
   const insideRadiusIdsRef = useRef({});
   const nativeWatchCallbackIdRef = useRef(null);
-  const lastSpokenNavStepRef = useRef(-1);
+
+  const spokenEarlyStepRef = useRef(new Set());
+  const spokenMainStepRef = useRef(new Set());
+  const lastRerouteAtRef = useRef(0);
+  const arrivalSpokenRef = useRef(false);
+  const navStartedSpokenRef = useRef(false);
 
   useEffect(() => {
     async function bootstrap() {
@@ -519,7 +708,7 @@ export default function App() {
         setSearchResults(results);
       } catch (error) {
         console.error(error);
-        setRouteError("Could not search places.");
+        setRouteError(error?.message || "Could not search places.");
         setSearchResults([]);
       } finally {
         setSearching(false);
@@ -540,10 +729,13 @@ export default function App() {
       return filtered.map((camera) => ({
         ...camera,
         distanceMeters: Infinity,
+        bearingToCamera: null,
         ahead: true,
         nearRoute: false,
       }));
     }
+
+    const userHeading = getHeadingDegrees(position.coords);
 
     return filtered
       .map((camera) => {
@@ -554,6 +746,15 @@ export default function App() {
           camera.lng
         );
 
+        const bearingToCamera = bearingBetweenPoints(
+          position.coords.latitude,
+          position.coords.longitude,
+          camera.lat,
+          camera.lng
+        );
+
+        const ahead = isLikelyAhead(userHeading, bearingToCamera);
+
         const nearRoute =
           routeCoords.length >= 2
             ? isCameraNearRoute(camera, routeCoords, 120)
@@ -562,7 +763,8 @@ export default function App() {
         return {
           ...camera,
           distanceMeters,
-          ahead: true,
+          bearingToCamera,
+          ahead,
           nearRoute,
         };
       })
@@ -584,7 +786,8 @@ export default function App() {
     cameras.forEach((camera) => {
       if (
         Number.isFinite(camera.distanceMeters) &&
-        camera.distanceMeters <= alertRadiusMeters
+        camera.distanceMeters <= alertRadiusMeters &&
+        camera.ahead
       ) {
         currentInsideRadius[camera.id] = true;
       }
@@ -599,6 +802,7 @@ export default function App() {
     let candidates = cameras.filter((camera) => {
       if (!Number.isFinite(camera.distanceMeters)) return false;
       if (camera.distanceMeters > alertRadiusMeters) return false;
+      if (!camera.ahead) return false;
       return true;
     });
 
@@ -613,7 +817,11 @@ export default function App() {
 
     if (candidates.length === 0) {
       setStatus(
-        "Traffic camera alerts are active. No immediate alerts right now."
+        isNavigating
+          ? rerouting
+            ? "Rebuilding route..."
+            : "Voice navigation and traffic camera alerts are active."
+          : "Traffic camera alerts are active. No immediate alerts right now."
       );
       return;
     }
@@ -627,7 +835,10 @@ export default function App() {
       const alreadySpoken = !!spokenCameraIdsRef.current[camera.id];
 
       if (!alreadyInside && !alreadySpoken) {
-        const text = getAlertText(camera);
+        const text = getCameraAlertText(
+          camera,
+          metersToFeet(camera.distanceMeters)
+        );
 
         spokenCameraIdsRef.current[camera.id] = true;
         insideRadiusIdsRef.current[camera.id] = true;
@@ -641,7 +852,7 @@ export default function App() {
         if (voiceEnabled) {
           setTimeout(() => {
             speakText(text);
-          }, 600 * index);
+          }, 300 * index);
         }
 
         fireLocalNotification(
@@ -667,50 +878,203 @@ export default function App() {
           : "Traffic camera alerts are active near your current location."
       );
     } else {
-      setStatus("Traffic camera alerts are active. Monitoring nearby cameras.");
+      setStatus(
+        isNavigating
+          ? rerouting
+            ? "Rebuilding route..."
+            : "Voice navigation and traffic camera alerts are active."
+          : "Traffic camera alerts are active. Monitoring nearby cameras."
+      );
     }
-  }, [started, position, cameras, voiceEnabled, alertRadiusFeet, routeCoords]);
-  useEffect(() => {
-    if (!isNavigating || !position || routeSteps.length === 0) return;
+  }, [
+    started,
+    position,
+    cameras,
+    voiceEnabled,
+    alertRadiusFeet,
+    routeCoords,
+    isNavigating,
+    rerouting,
+  ]);
 
-    const currentStep = routeSteps[navStepIndex];
-    if (!currentStep) return;
+  async function rebuildRouteFromCurrentPosition(speakReroute = true) {
+    if (!destination || !position?.coords || rerouting) return;
 
-    if (lastSpokenNavStepRef.current !== navStepIndex) {
-      const instruction = buildStepInstruction(currentStep);
-      if (voiceEnabled) {
-        speakText(instruction);
+    const now = Date.now();
+    if (now - lastRerouteAtRef.current < 7000) return;
+
+    lastRerouteAtRef.current = now;
+    setRerouting(true);
+
+    try {
+      if (voiceEnabled && speakReroute) {
+        speakText("Recalculating route.");
       }
-      lastSpokenNavStepRef.current = navStepIndex;
-      setStatus(`Navigation active: ${instruction}`);
+
+      const route = await getRoute(
+        position.coords.latitude,
+        position.coords.longitude,
+        destination.lat,
+        destination.lng
+      );
+
+      setRouteCoords(route.geometry.map(([lng, lat]) => [lat, lng]));
+      setRouteInfo({
+        distanceMeters: route.distanceMeters,
+        durationSeconds: route.durationSeconds,
+      });
+      setRouteSteps(route.steps || []);
+      setAlternativeRoutes(route.alternatives || []);
+      setNavStepIndex(0);
+
+      spokenEarlyStepRef.current = new Set();
+      spokenMainStepRef.current = new Set();
+      arrivalSpokenRef.current = false;
+      navStartedSpokenRef.current = false;
+
+      setStatus("Route updated.");
+      if (voiceEnabled) {
+        setTimeout(() => {
+          const first = route.steps?.[0];
+          if (first) {
+            speakText(getSpokenInstruction(first, "early"));
+            navStartedSpokenRef.current = true;
+          }
+        }, 800);
+      }
+    } catch (error) {
+      console.error("Reroute error:", error);
+      setRouteError(error?.message || "Could not rebuild route.");
+    } finally {
+      setRerouting(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!isNavigating || !position || !destination || routeSteps.length === 0) {
+      return;
     }
 
-    const maneuverLocation = currentStep?.maneuver?.location;
-    if (!Array.isArray(maneuverLocation) || maneuverLocation.length < 2) return;
+    const userLat = position.coords.latitude;
+    const userLng = position.coords.longitude;
+    const userSpeedMps =
+      typeof position.coords.speed === "number" && position.coords.speed > 0
+        ? position.coords.speed
+        : 0;
+    const userSpeedMph = userSpeedMps * 2.23694;
 
-    const [stepLng, stepLat] = maneuverLocation;
-
-    if (!Number.isFinite(stepLat) || !Number.isFinite(stepLng)) return;
-
-    const distanceToStep = distanceInMeters(
-      position.coords.latitude,
-      position.coords.longitude,
-      stepLat,
-      stepLng
+    const destinationDistance = distanceInMeters(
+      userLat,
+      userLng,
+      destination.lat,
+      destination.lng
     );
 
-    if (distanceToStep <= 40) {
-      if (navStepIndex < routeSteps.length - 1) {
-        setNavStepIndex((prev) => prev + 1);
-      } else {
-        if (voiceEnabled) {
-          speakText("You have arrived at your destination.");
-        }
-        setIsNavigating(false);
-        setStatus("Navigation complete. You have arrived.");
+    if (destinationDistance <= 35 && !arrivalSpokenRef.current) {
+      arrivalSpokenRef.current = true;
+      if (voiceEnabled) {
+        speakText("You have arrived at your destination.");
       }
+      setIsNavigating(false);
+      setStatus("Navigation complete. You have arrived.");
+      return;
     }
-  }, [isNavigating, position, routeSteps, navStepIndex, voiceEnabled]);
+
+    const offRouteDistance = distanceToRouteMeters(
+      userLat,
+      userLng,
+      routeCoords
+    );
+    const offRouteThreshold = userSpeedMph >= 35 ? 90 : 60;
+
+    if (offRouteDistance > offRouteThreshold) {
+      rebuildRouteFromCurrentPosition(true);
+      return;
+    }
+
+    const nextIndex = (() => {
+      let bestIndex = navStepIndex;
+      let bestDistance = Infinity;
+
+      const maxLookAhead = Math.min(routeSteps.length - 1, navStepIndex + 3);
+      for (let i = navStepIndex; i <= maxLookAhead; i++) {
+        const d = getStepProgressDistance(routeSteps[i], userLat, userLng);
+        if (d < bestDistance) {
+          bestDistance = d;
+          bestIndex = i;
+        }
+      }
+      return bestIndex;
+    })();
+
+    if (nextIndex !== navStepIndex) {
+      setNavStepIndex(nextIndex);
+    }
+
+    const currentStep = routeSteps[nextIndex];
+    if (!currentStep) return;
+
+    const distanceToCurrentStep = getStepProgressDistance(
+      currentStep,
+      userLat,
+      userLng
+    );
+
+    let earlyWarningFeet = 250;
+    if (userSpeedMph >= 50) earlyWarningFeet = 1000;
+    else if (userSpeedMph >= 35) earlyWarningFeet = 700;
+    else if (userSpeedMph >= 20) earlyWarningFeet = 400;
+
+    const earlyWarningMeters = earlyWarningFeet / 3.28084;
+    const immediateMeters = 30;
+    const stepKey = `step-${nextIndex}`;
+
+    if (
+      !spokenEarlyStepRef.current.has(stepKey) &&
+      distanceToCurrentStep <= earlyWarningMeters &&
+      distanceToCurrentStep > immediateMeters
+    ) {
+      spokenEarlyStepRef.current.add(stepKey);
+      const text = getSpokenInstruction(currentStep, "early");
+      setStatus(text);
+      if (voiceEnabled) speakText(text);
+      return;
+    }
+
+    if (
+      !spokenMainStepRef.current.has(stepKey) &&
+      distanceToCurrentStep <= immediateMeters
+    ) {
+      spokenMainStepRef.current.add(stepKey);
+      const text = getSpokenInstruction(currentStep, "main");
+      setStatus(text);
+      if (voiceEnabled) speakText(text);
+
+      if (nextIndex < routeSteps.length - 1) {
+        setTimeout(() => {
+          setNavStepIndex((prev) =>
+            prev < routeSteps.length - 1 ? prev + 1 : prev
+          );
+        }, 1200);
+      }
+      return;
+    }
+
+    if (!navStartedSpokenRef.current && routeSteps[0]) {
+      navStartedSpokenRef.current = true;
+      const text = getSpokenInstruction(routeSteps[0], "early");
+      setStatus(`Navigation started. ${text}`);
+      if (voiceEnabled) speakText(`Navigation started. ${text}`);
+    }
+  }, [
+    isNavigating,
+    position,
+    destination,
+    routeCoords,
+    routeSteps,
+    navStepIndex,
+    voiceEnabled,
+  ]);
 
   async function startDriveMode() {
     try {
@@ -747,7 +1111,7 @@ export default function App() {
           {
             enableHighAccuracy: true,
             timeout: 30000,
-            maximumAge: 10000,
+            maximumAge: 3000,
           },
           (pos, err) => {
             if (err) {
@@ -761,7 +1125,11 @@ export default function App() {
               setPermissionReady(true);
               setLocationError("");
               setStatus(
-                "Traffic camera alerts are active. Tracking location live."
+                isNavigating
+                  ? rerouting
+                    ? "Rebuilding route..."
+                    : "Voice navigation and traffic camera alerts are active."
+                  : "Traffic camera alerts are active. Tracking location live."
               );
             }
           }
@@ -788,7 +1156,11 @@ export default function App() {
           setPermissionReady(true);
           setLocationError("");
           setStatus(
-            "Traffic camera alerts are active. Tracking location live."
+            isNavigating
+              ? rerouting
+                ? "Rebuilding route..."
+                : "Voice navigation and traffic camera alerts are active."
+              : "Traffic camera alerts are active. Tracking location live."
           );
         },
         (error) => {
@@ -811,7 +1183,7 @@ export default function App() {
         },
         {
           enableHighAccuracy: true,
-          maximumAge: 10000,
+          maximumAge: 3000,
           timeout: 30000,
         }
       );
@@ -843,12 +1215,17 @@ export default function App() {
     if (typeof window !== "undefined" && window.speechSynthesis) {
       window.speechSynthesis.cancel();
     }
+
     setIsNavigating(false);
     setNavStepIndex(0);
-    lastSpokenNavStepRef.current = -1;
+    setRerouting(false);
     setStarted(false);
     setStatus("Traffic camera alerts stopped.");
     insideRadiusIdsRef.current = {};
+    spokenEarlyStepRef.current = new Set();
+    spokenMainStepRef.current = new Set();
+    arrivalSpokenRef.current = false;
+    navStartedSpokenRef.current = false;
   }
 
   async function handleSearch() {
@@ -864,7 +1241,7 @@ export default function App() {
       }
     } catch (error) {
       console.error(error);
-      setRouteError("Could not search places.");
+      setRouteError(error?.message || "Could not search places.");
       setSearchResults([]);
     } finally {
       setSearching(false);
@@ -872,22 +1249,28 @@ export default function App() {
   }
 
   async function selectDestination(place) {
-    if (!position?.coords) {
-      setRouteError(
-        "Start traffic camera alerts first so the app can get your current location."
-      );
-      return;
-    }
-
     try {
       setRouteLoading(true);
       setRouteError("");
+      setRouteCoords([]);
+      setRouteInfo(null);
+      setRouteSteps([]);
+      setAlternativeRoutes([]);
       setDestination(place);
       setSearchQuery(place.name);
       setSearchResults([]);
       setIsNavigating(false);
       setNavStepIndex(0);
-      lastSpokenNavStepRef.current = -1;
+      setRerouting(false);
+
+      spokenEarlyStepRef.current = new Set();
+      spokenMainStepRef.current = new Set();
+      arrivalSpokenRef.current = false;
+      navStartedSpokenRef.current = false;
+
+      if (!Number.isFinite(place?.lat) || !Number.isFinite(place?.lng)) {
+        throw new Error("Destination coordinates are invalid.");
+      }
 
       const updatedRecents = [
         place,
@@ -899,9 +1282,22 @@ export default function App() {
       setRecentSearches(updatedRecents);
       saveRecentSearches(updatedRecents);
 
+      let currentPos = position;
+
+      if (
+        !currentPos?.coords ||
+        !Number.isFinite(currentPos.coords.latitude) ||
+        !Number.isFinite(currentPos.coords.longitude)
+      ) {
+        const freshPos = await getFreshPosition();
+        currentPos = freshPos;
+        setPosition(freshPos);
+        setPermissionReady(true);
+      }
+
       const route = await getRoute(
-        position.coords.latitude,
-        position.coords.longitude,
+        currentPos.coords.latitude,
+        currentPos.coords.longitude,
         place.lat,
         place.lng
       );
@@ -911,55 +1307,84 @@ export default function App() {
         distanceMeters: route.distanceMeters,
         durationSeconds: route.durationSeconds,
       });
-      setRouteSteps(route.steps);
+      setRouteSteps(route.steps || []);
+      setAlternativeRoutes(route.alternatives || []);
       setNavStepIndex(0);
-      lastSpokenNavStepRef.current = -1;
-      setStatus(
-        "Route ready. Washington, DC traffic camera alerts will follow your active route."
-      );
+      setStatus("Route ready. Voice navigation is ready to start.");
     } catch (error) {
-      console.error(error);
-      setRouteError("Could not build route.");
+      console.error("Route build error:", error);
+      setRouteError(error?.message || "Could not build route.");
       setRouteCoords([]);
       setRouteInfo(null);
       setRouteSteps([]);
+      setAlternativeRoutes([]);
     } finally {
       setRouteLoading(false);
     }
   }
 
   async function useCurrentLocationAsSearch() {
-    if (!position?.coords) {
+    try {
+      let currentPos = position;
+
+      if (!currentPos?.coords) {
+        const freshPos = await getFreshPosition();
+        currentPos = freshPos;
+        setPosition(freshPos);
+        setPermissionReady(true);
+      }
+
+      const place = {
+        id: "current-location",
+        name: "Current Location",
+        subtitle: "DMV Area",
+        full: "Current Location",
+        lat: currentPos.coords.latitude,
+        lng: currentPos.coords.longitude,
+      };
+
+      setDestination(place);
+      setSearchQuery("Current Location");
+      setSearchResults([]);
+    } catch (error) {
+      console.error(error);
       setRouteError("Current location is not ready yet.");
-      return;
     }
-
-    const place = {
-      id: "current-location",
-      name: "Current Location",
-      subtitle: "DMV Area",
-      full: "Current Location",
-      lat: position.coords.latitude,
-      lng: position.coords.longitude,
-    };
-
-    setDestination(place);
-    setSearchQuery("Current Location");
-    setSearchResults([]);
   }
+
   function startNavigation() {
     if (!routeSteps.length) return;
 
     setIsNavigating(true);
     setNavStepIndex(0);
-    lastSpokenNavStepRef.current = -1;
-    setStatus("Navigation started.");
+    setRerouting(false);
+    spokenEarlyStepRef.current = new Set();
+    spokenMainStepRef.current = new Set();
+    arrivalSpokenRef.current = false;
+    navStartedSpokenRef.current = false;
+
+    const firstStep = routeSteps[0];
+    if (firstStep) {
+      const spoken = getSpokenInstruction(firstStep, "early");
+      setStatus(`Navigation started. ${spoken}`);
+
+      if (voiceEnabled) {
+        speakText(`Navigation started. ${spoken}`);
+      }
+      navStartedSpokenRef.current = true;
+    } else {
+      setStatus("Navigation started.");
+    }
   }
 
   function stopNavigation() {
     setIsNavigating(false);
     setNavStepIndex(0);
-    lastSpokenNavStepRef.current = -1;
+    setRerouting(false);
+    spokenEarlyStepRef.current = new Set();
+    spokenMainStepRef.current = new Set();
+    arrivalSpokenRef.current = false;
+    navStartedSpokenRef.current = false;
 
     if (typeof window !== "undefined" && window.speechSynthesis) {
       window.speechSynthesis.cancel();
@@ -967,17 +1392,25 @@ export default function App() {
 
     setStatus("Navigation stopped.");
   }
+
   function clearRoute() {
     setDestination(null);
     setRouteCoords([]);
     setRouteInfo(null);
     setRouteSteps([]);
+    setAlternativeRoutes([]);
     setSearchResults([]);
     setRouteError("");
     setSearchQuery("");
     setIsNavigating(false);
     setNavStepIndex(0);
-    lastSpokenNavStepRef.current = -1;
+    setRerouting(false);
+
+    spokenEarlyStepRef.current = new Set();
+    spokenMainStepRef.current = new Set();
+    arrivalSpokenRef.current = false;
+    navStartedSpokenRef.current = false;
+
     setStatus(
       started
         ? "Traffic camera alerts are active. Route cleared."
@@ -992,10 +1425,10 @@ export default function App() {
     ? getCardinalDirection(getHeadingDegrees(position.coords))
     : "--";
 
-  const mapCenter = destination
-    ? [destination.lat, destination.lng]
-    : position?.coords
+  const mapCenter = position?.coords
     ? [position.coords.latitude, position.coords.longitude]
+    : destination
+    ? [destination.lat, destination.lng]
     : [38.9072, -77.0369];
 
   return (
@@ -1025,9 +1458,8 @@ export default function App() {
         >
           <h2 style={{ marginTop: 0 }}>GPS Navigation</h2>
           <p style={{ color: "#bbb", lineHeight: 1.6 }}>
-            Traffic Camera Alerts and GPS in The DMV Area. Click the Red Button
-            to Get Alerted for Red Light, Stop Sign, and Speed Cameras in
-            Washington DC.
+            Traffic camera alerts and GPS in the DMV area. Voice guidance speaks
+            turn-by-turn directions and reroutes if the driver goes off route.
           </p>
 
           <div
@@ -1074,7 +1506,8 @@ export default function App() {
 
             <button
               onClick={() => {
-                const text = getAlertText({ type: "speed" });
+                const text =
+                  "Speed Camera Ahead in 200 feet. Please Follow Posted Speed Limit";
                 setLastAlert(text);
                 if (voiceEnabled) speakText(text);
                 fireLocalNotification(
@@ -1093,7 +1526,7 @@ export default function App() {
                 cursor: "pointer",
               }}
             >
-              Test Voice Alert
+              Test Traffic Camera Alerts
             </button>
           </div>
 
@@ -1298,7 +1731,7 @@ export default function App() {
                   </button>
                 )}
 
-                {routeSteps.length > 0 && (
+                {isNavigating && (
                   <div
                     style={{
                       background: "#111",
@@ -1308,15 +1741,39 @@ export default function App() {
                       color: "#ddd",
                     }}
                   >
-                    <strong>Next step:</strong>{" "}
-                    {buildStepInstruction(
-                      routeSteps[navStepIndex] || routeSteps[0]
-                    )}
+                    {rerouting
+                      ? "Recalculating route..."
+                      : "Voice navigation active"}
                   </div>
                 )}
               </div>
+
+              {alternativeRoutes.length > 0 && (
+                <div style={{ marginTop: "14px" }}>
+                  <div style={{ fontWeight: "bold", marginBottom: "8px" }}>
+                    Alternate routes available
+                  </div>
+                  {alternativeRoutes.map((route) => (
+                    <div
+                      key={route.id}
+                      style={{
+                        background: "#111",
+                        border: "1px solid #333",
+                        borderRadius: "10px",
+                        padding: "10px 12px",
+                        marginTop: "8px",
+                        color: "#bbb",
+                      }}
+                    >
+                      {formatDistance(route.distanceMeters)} •{" "}
+                      {formatDuration(route.durationSeconds)}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
+
           <div
             style={{
               marginTop: "18px",
@@ -1407,6 +1864,9 @@ export default function App() {
                           ? "Near active route"
                           : "Not on active route"}
                       </div>
+                      <div style={{ marginTop: "4px" }}>
+                        {camera.ahead ? "Ahead of driver" : "Other direction"}
+                      </div>
                     </div>
                   </Popup>
                 </CircleMarker>
@@ -1414,40 +1874,6 @@ export default function App() {
             </MapContainer>
           </div>
         </div>
-
-        {routeSteps.length > 0 && (
-          <div
-            style={{
-              background: "#1b1b1b",
-              border: "1px solid #333",
-              borderRadius: "16px",
-              padding: "20px",
-              marginTop: "20px",
-            }}
-          >
-            <h2 style={{ marginTop: 0 }}>Directions</h2>
-            {routeSteps.slice(0, 12).map((step, index) => (
-              <div
-                key={`${step.name}-${index}`}
-                style={{
-                  background: "#111",
-                  border: "1px solid #333",
-                  borderRadius: "12px",
-                  padding: "14px",
-                  marginTop: "10px",
-                }}
-              >
-                <div style={{ fontWeight: "bold" }}>
-                  {buildStepInstruction(step)}
-                </div>
-                <div style={{ color: "#bbb", marginTop: "6px" }}>
-                  {formatDistance(step.distance)} •{" "}
-                  {formatDuration(step.duration)}
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
 
         <div
           style={{
@@ -1633,6 +2059,7 @@ export default function App() {
               <div style={{ fontWeight: "bold", fontSize: "18px" }}>
                 {camera.typeLabel || "Camera"}
                 {camera.nearRoute ? " • Near Route" : ""}
+                {camera.ahead ? " • Ahead" : " • Other Direction"}
               </div>
               <div style={{ marginTop: "6px" }}>{camera.name}</div>
               <div style={{ color: "#bbb", marginTop: "4px" }}>
